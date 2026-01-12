@@ -19,6 +19,74 @@ def sha1_file(p: Path) -> str:
     return h.hexdigest()
 
 def iter_tab_rows(tab_path: Path) -> Tuple[List[str], List[str], Iterable[Dict[str, object]]]:
+    # First pass: read header + types
+    with tab_path.open("r", encoding="utf-8-sig", errors="replace") as f:
+        def next_data_line():
+            for line in f:
+                line = line.rstrip("\n")
+                if not line.strip():
+                    continue
+                if line.lstrip().startswith("#"):
+                    continue
+                return line
+            return None
+
+        header = next_data_line()
+        if header is None:
+            raise ValueError(f"Empty tab: {tab_path}")
+
+        types = next_data_line()
+        if types is None:
+            raise ValueError(f"Missing type row: {tab_path}")
+
+    columns = TAB_SPLIT.split(header)
+    type_codes = TAB_SPLIT.split(types)
+
+    if len(type_codes) < len(columns):
+        type_codes += ["s"] * (len(columns) - len(type_codes))
+    if len(columns) < len(type_codes):
+        columns += [f"col_{i}" for i in range(len(columns), len(type_codes))]
+
+    def cast(t: str, v: str) -> object:
+        v = v.strip()
+        if v == "":
+            return None
+        t = (t or "s").strip()
+        try:
+            if t in ("i", "e"):
+                return int(v)
+            if t == "f":
+                return float(v)
+            if t == "b":
+                if v.lower() in ("true", "t", "yes", "y"):
+                    return True
+                if v.lower() in ("false", "f", "no", "n"):
+                    return False
+                return bool(int(v))
+        except Exception:
+            return v
+        return v
+
+    # Second pass: generator re-opens file and skips first 2 data lines
+    def row_iter():
+        with tab_path.open("r", encoding="utf-8-sig", errors="replace") as f2:
+            skipped = 0
+            for line in f2:
+                line = line.rstrip("\n")
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                skipped += 1
+                if skipped <= 2:
+                    continue  # skip header + type row
+
+                parts = TAB_SPLIT.split(line)
+                n = len(columns)
+                if len(parts) < n:
+                    parts += [""] * (n - len(parts))
+                data = {columns[i]: cast(type_codes[i], parts[i]) for i in range(n)}
+                yield data
+
+    return columns, type_codes, row_iter()
     with tab_path.open("r", encoding="utf-8-sig", errors="replace") as f:
         def next_data_line():
             for line in f:
