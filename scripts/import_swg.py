@@ -5,11 +5,20 @@ from typing import Dict, List, Tuple, Iterable, Optional
 import psycopg2
 import psycopg2.extras
 
+TAB_INCLUDE_RE = os.environ.get("TAB_INCLUDE_RE", "")
+TAB_EXCLUDE_RE = os.environ.get("TAB_EXCLUDE_RE", "")
+IMPORT_STF = os.environ.get("IMPORT_STF", "0") == "1"
+
+include_pat = re.compile(TAB_INCLUDE_RE, re.IGNORECASE) if TAB_INCLUDE_RE else None
+exclude_pat = re.compile(TAB_EXCLUDE_RE, re.IGNORECASE) if TAB_EXCLUDE_RE else None
+
 TAB_SPLIT = re.compile(r"\t")
+
 
 def sh(cmd: List[str], cwd: Optional[Path] = None) -> str:
     p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True, capture_output=True, text=True)
     return p.stdout.strip()
+
 
 def sha1_file(p: Path) -> str:
     h = hashlib.sha1()
@@ -17,6 +26,7 @@ def sha1_file(p: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
 
 def iter_tab_rows(tab_path: Path) -> Tuple[List[str], List[str], Iterable[Dict[str, object]]]:
     # First pass: read header + types
@@ -87,75 +97,19 @@ def iter_tab_rows(tab_path: Path) -> Tuple[List[str], List[str], Iterable[Dict[s
                 yield data
 
     return columns, type_codes, row_iter()
-    with tab_path.open("r", encoding="utf-8-sig", errors="replace") as f:
-        def next_data_line():
-            for line in f:
-                line = line.rstrip("\n")
-                if not line.strip():
-                    continue
-                if line.lstrip().startswith("#"):
-                    continue
-                return line
-            return None
 
-        header = next_data_line()
-        if header is None:
-            raise ValueError(f"Empty tab: {tab_path}")
-
-        types = next_data_line()
-        if types is None:
-            raise ValueError(f"Missing type row: {tab_path}")
-
-        columns = TAB_SPLIT.split(header)
-        type_codes = TAB_SPLIT.split(types)
-
-        if len(type_codes) < len(columns):
-            type_codes += ["s"] * (len(columns) - len(type_codes))
-        if len(columns) < len(type_codes):
-            columns += [f"col_{i}" for i in range(len(columns), len(type_codes))]
-
-        def cast(t: str, v: str) -> object:
-            v = v.strip()
-            if v == "":
-                return None
-            t = (t or "s").strip()
-            try:
-                if t in ("i", "e"):
-                    return int(v)
-                if t == "f":
-                    return float(v)
-                if t == "b":
-                    if v.lower() in ("true", "t", "yes", "y"):
-                        return True
-                    if v.lower() in ("false", "f", "no", "n"):
-                        return False
-                    return bool(int(v))
-            except Exception:
-                return v
-            return v
-
-        def row_iter():
-            for line in f:
-                line = line.rstrip("\n")
-                if not line.strip():
-                    continue
-                if line.lstrip().startswith("#"):
-                    continue
-                parts = TAB_SPLIT.split(line)
-                n = len(columns)
-                if len(parts) < n:
-                    parts += [""] * (n - len(parts))
-                data = {columns[i]: cast(type_codes[i], parts[i]) for i in range(n)}
-                yield data
-
-        return columns, type_codes, row_iter()
 
 def read_u32_le(buf: bytes, off: int):
-    return int.from_bytes(buf[off:off+4], "little", signed=False), off + 4
+    return int.from_bytes(buf[off:off + 4], "little", signed=False), off + 4
+
+
 def read_u8(buf: bytes, off: int):
     return buf[off], off + 1
+
+
 def read_u16_le(buf: bytes, off: int):
-    return int.from_bytes(buf[off:off+2], "little", signed=False), off + 2
+    return int.from_bytes(buf[off:off + 2], "little", signed=False), off + 2
+
 
 def parse_stf(stf_path: Path) -> Dict[str, str]:
     buf = stf_path.read_bytes()
@@ -185,11 +139,12 @@ def parse_stf(stf_path: Path) -> Dict[str, str]:
     for _ in range(count):
         sid, off = read_u32_le(buf, off)
         runes, off = read_u32_le(buf, off)
-        raw = buf[off:off+runes]
+        raw = buf[off:off + runes]
         off += runes
         names[sid] = raw.decode("utf-8", errors="replace")
 
     return {names[sid]: values[sid] for sid in names if sid in values}
+
 
 def upsert_datatable(cur, source_repo, source_ref, path, sha1, row_count, col_count) -> int:
     cur.execute(
@@ -204,6 +159,7 @@ def upsert_datatable(cur, source_repo, source_ref, path, sha1, row_count, col_co
     )
     return cur.fetchone()[0]
 
+
 def replace_columns(cur, datatable_id: int, columns: List[str], types: List[str]) -> None:
     cur.execute("delete from public.new_datatable_columns where datatable_id=%s", (datatable_id,))
     psycopg2.extras.execute_values(
@@ -215,6 +171,7 @@ def replace_columns(cur, datatable_id: int, columns: List[str], types: List[str]
         [(datatable_id, i, columns[i], types[i]) for i in range(len(columns))],
         page_size=1000,
     )
+
 
 def replace_rows(cur, datatable_id: int, rows: Iterable[Dict[str, object]], batch_size: int = 1000) -> int:
     cur.execute("delete from public.new_datatable_rows where datatable_id=%s", (datatable_id,))
@@ -243,6 +200,7 @@ def replace_rows(cur, datatable_id: int, rows: Iterable[Dict[str, object]], batc
         total += len(batch)
     return total
 
+
 def upsert_stf_file(cur, source_repo, source_ref, path, sha1, entry_count) -> int:
     cur.execute(
         """
@@ -256,6 +214,7 @@ def upsert_stf_file(cur, source_repo, source_ref, path, sha1, entry_count) -> in
     )
     return cur.fetchone()[0]
 
+
 def replace_stf_entries(cur, stf_file_id: int, entries: Dict[str, str], batch_size: int = 2000) -> None:
     cur.execute("delete from public.new_stf_entries where stf_file_id=%s", (stf_file_id,))
     items = list(entries.items())
@@ -267,6 +226,7 @@ def replace_stf_entries(cur, stf_file_id: int, entries: Dict[str, str], batch_si
             [(stf_file_id, k, v) for (k, v) in chunk],
             page_size=batch_size,
         )
+
 
 def main():
     db_url = os.environ["SUPABASE_DB_URL"]
@@ -300,8 +260,19 @@ def main():
     try:
         with conn.cursor() as cur:
             tab_files = list(dsrc_dir.rglob("*.tab"))
+
+            kept = 0
             for p in tab_files:
                 rel = p.relative_to(dsrc_dir).as_posix()
+
+                if include_pat and not include_pat.search(rel):
+                    continue
+                if exclude_pat and exclude_pat.search(rel):
+                    continue
+
+                kept += 1
+                print(f"[TAB] {rel}")
+
                 columns, types, rows_iter = iter_tab_rows(p)
 
                 dt_id = upsert_datatable(cur, dsrc_repo, dsrc_ref, rel, sha1_file(p), 0, len(columns))
@@ -310,17 +281,26 @@ def main():
                 cur.execute("update public.new_datatables set row_count=%s where id=%s", (row_count, dt_id))
                 conn.commit()
 
-            stf_files = list(client_dir.rglob("*.stf"))
-            for p in stf_files:
-                rel = p.relative_to(client_dir).as_posix()
-                entries = parse_stf(p)
-                stf_id = upsert_stf_file(cur, client_repo, client_ref, rel, sha1_file(p), len(entries))
-                replace_stf_entries(cur, stf_id, entries)
-                conn.commit()
+            print(f"Kept {kept} / {len(tab_files)} tab files")
+
+            if IMPORT_STF:
+                stf_files = list(client_dir.rglob("*.stf"))
+                for p in stf_files:
+                    rel = p.relative_to(client_dir).as_posix()
+                    try:
+                        entries = parse_stf(p)
+                    except Exception as e:
+                        print(f"[WARN] skipping stf {rel}: {e}")
+                        conn.commit()
+                        continue
+
+                    stf_id = upsert_stf_file(cur, client_repo, client_ref, rel, sha1_file(p), len(entries))
+                    replace_stf_entries(cur, stf_id, entries)
+                    conn.commit()
 
             cur.execute(
                 "update public.new_import_runs set status='ok', details=details||%s::jsonb where id=%s",
-                (json.dumps({"tabs": len(tab_files), "stfs": len(stf_files)}), run_id),
+                (json.dumps({"tabs_total": len(tab_files), "tabs_kept": kept, "stf": IMPORT_STF}), run_id),
             )
             conn.commit()
 
@@ -335,6 +315,7 @@ def main():
         raise
     finally:
         conn.close()
+
 
 if __name__ == "__main__":
     main()

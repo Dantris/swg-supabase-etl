@@ -29,5 +29,12 @@ jobs:
           DSRC_REF: master
           CLIENT_REPO: https://github.com/SWG-Source/client-assets.git
           CLIENT_REF: master
+
+          # Only bring what you asked for:
+          TAB_INCLUDE_RE: '(quest|creature|npc|loot|junk|chu[_-]?gon[_-]?dar|schem|draft[_-]?schem|item|weapon|armor|waypoint|poi|spawn)'
+          TAB_EXCLUDE_RE: '(terrain|region|area|planetmap|map|ui|appearance|shader|client)'
+
+          # strings off for now (we can add later)
+          IMPORT_STF: '0'
         run: |
-          python scripts/import_swg.py
+          python -u scripts/import_swg.py
