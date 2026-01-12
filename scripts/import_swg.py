@@ -19,7 +19,13 @@ exclude_pat = re.compile(TAB_EXCLUDE_RE, re.IGNORECASE) if TAB_EXCLUDE_RE else N
 
 
 def sh(cmd: List[str], cwd: Optional[Path] = None) -> str:
-    p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True, capture_output=True, text=True)
+    p = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     return p.stdout.strip()
 
 
@@ -80,8 +86,8 @@ def iter_tab_rows(tab_path: Path) -> Tuple[List[str], List[str], Iterable[Dict[s
             return v
         return v
 
+    # Re-open file so generator doesn't depend on closed handle
     def row_iter():
-        # Re-open file so the generator doesn't depend on a closed handle
         with tab_path.open("r", encoding="utf-8-sig", errors="replace") as f2:
             skipped = 0
             for line in f2:
@@ -100,7 +106,7 @@ def iter_tab_rows(tab_path: Path) -> Tuple[List[str], List[str], Iterable[Dict[s
     return columns, type_codes, row_iter()
 
 
-# STF parsing left in place but disabled by default; we can refine later if needed
+# STF parsing (kept, disabled by default)
 def read_u32_le(buf: bytes, off: int):
     return int.from_bytes(buf[off:off + 4], "little", signed=False), off + 4
 def read_u8(buf: bytes, off: int):
@@ -141,39 +147,75 @@ def parse_stf(stf_path: Path) -> Dict[str, str]:
     return {names[sid]: values[sid] for sid in names if sid in values}
 
 
-def upsert_inventory(cur, source_repo, source_ref, kind, path, sha1):
-    cur.execute("""
-      insert into public.new_ingest_files (source_repo, source_ref, kind, path, sha1, status, updated_at)
-      values (%s,%s,%s,%s,%s,'pending',now())
-      on conflict (source_repo, source_ref, kind, path)
-      do update set
-        sha1 = excluded.sha1,
-        updated_at = now(),
-        status = case
-          when public.new_ingest_files.sha1 = excluded.sha1 and public.new_ingest_files.status = 'ok'
-            then 'ok'
-          else 'pending'
-        end
-    """, (source_repo, source_ref, kind, path, sha1))
+def upsert_inventory(cur, source_repo, source_ref, kind, path, sha1, status):
+    # status is either 'ok' (already imported) or 'pending' (needs import)
+    cur.execute(
+        """
+        insert into public.new_ingest_files
+          (source_repo, source_ref, kind, path, sha1, status, updated_at)
+        values
+          (%s,%s,%s,%s,%s,%s,now())
+        on conflict (source_repo, source_ref, kind, path)
+        do update set
+          -- keep sha1 if we already have a real one and incoming is empty
+          sha1 = case
+                  when excluded.sha1 is not null and excluded.sha1 <> '' then excluded.sha1
+                  else public.new_ingest_files.sha1
+                end,
+          status = case
+                    when excluded.status = 'ok' then 'ok'
+                    when public.new_ingest_files.status = 'ok' then 'ok'
+                    else public.new_ingest_files.status
+                  end,
+          updated_at = now()
+        """,
+        (source_repo, source_ref, kind, path, sha1 or "", status),
+    )
 
 
-def mark_status(cur, source_repo, source_ref, kind, path, status, last_error=None):
-    cur.execute("""
-      update public.new_ingest_files
-      set status=%s, last_error=%s, updated_at=now()
-      where source_repo=%s and source_ref=%s and kind=%s and path=%s
-    """, (status, last_error, source_repo, source_ref, kind, path))
+def mark_status(cur, source_repo, source_ref, kind, path, status, last_error=None, sha1: Optional[str] = None):
+    cur.execute(
+        """
+        update public.new_ingest_files
+        set
+          status=%s,
+          last_error=%s,
+          sha1 = coalesce(%s, sha1),
+          updated_at=now()
+        where source_repo=%s and source_ref=%s and kind=%s and path=%s
+        """,
+        (status, last_error, sha1, source_repo, source_ref, kind, path),
+    )
 
 
 def next_pending(cur, source_repo, source_ref, kind, limit_n):
-    cur.execute("""
-      select path
-      from public.new_ingest_files
-      where source_repo=%s and source_ref=%s and kind=%s and status in ('pending','error')
-      order by path
-      limit %s
-    """, (source_repo, source_ref, kind, limit_n))
+    cur.execute(
+        """
+        select path
+        from public.new_ingest_files
+        where source_repo=%s and source_ref=%s and kind=%s
+          and status in ('pending','error')
+        order by path
+        limit %s
+        """,
+        (source_repo, source_ref, kind, limit_n),
+    )
     return [r[0] for r in cur.fetchall()]
+
+
+def datatable_existing(cur, source_repo, source_ref, path) -> Optional[Tuple[int, str]]:
+    cur.execute(
+        """
+        select id, sha1
+        from public.new_datatables
+        where source_repo=%s and source_ref=%s and path=%s
+        """,
+        (source_repo, source_ref, path),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return int(row[0]), (row[1] or "")
 
 
 def upsert_datatable(cur, source_repo, source_ref, path, sha1, row_count, col_count) -> int:
@@ -204,7 +246,7 @@ def replace_columns(cur, datatable_id: int, columns: List[str], types: List[str]
 
 
 def replace_rows(cur, datatable_id: int, rows: Iterable[Dict[str, object]], batch_size: int = 1000) -> int:
-    # IMPORTANT: only call this for files we are actually (re)importing.
+    # Only called when we truly need to import/refresh this file.
     cur.execute("delete from public.new_datatable_rows where datatable_id=%s", (datatable_id,))
     total, batch, idx = 0, [], 0
     for row in rows:
@@ -232,34 +274,9 @@ def replace_rows(cur, datatable_id: int, rows: Iterable[Dict[str, object]], batc
     return total
 
 
-def upsert_stf_file(cur, source_repo, source_ref, path, sha1, entry_count) -> int:
-    cur.execute(
-        """
-        insert into public.new_stf_files (source_repo, source_ref, path, sha1, entry_count)
-        values (%s,%s,%s,%s,%s)
-        on conflict (source_repo, source_ref, path)
-        do update set sha1=excluded.sha1, entry_count=excluded.entry_count
-        returning id
-        """,
-        (source_repo, source_ref, path, sha1, entry_count),
-    )
-    return cur.fetchone()[0]
-
-
-def replace_stf_entries(cur, stf_file_id: int, entries: Dict[str, str], batch_size: int = 2000) -> None:
-    cur.execute("delete from public.new_stf_entries where stf_file_id=%s", (stf_file_id,))
-    items = list(entries.items())
-    for i in range(0, len(items), batch_size):
-        chunk = items[i:i + batch_size]
-        psycopg2.extras.execute_values(
-            cur,
-            "insert into public.new_stf_entries (stf_file_id, key, text) values %s",
-            [(stf_file_id, k, v) for (k, v) in chunk],
-            page_size=batch_size,
-        )
-
-
 def main():
+    print("=== SWG IMPORTER (inventory/resume + skip already imported) ===", flush=True)
+
     db_url = os.environ["SUPABASE_DB_URL"]
     workdir = Path(os.environ.get("WORKDIR", "_work")).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
@@ -269,22 +286,51 @@ def main():
     client_repo = os.environ.get("CLIENT_REPO", "https://github.com/SWG-Source/client-assets.git")
     client_ref = os.environ.get("CLIENT_REF", "master")
 
+    print(f"Filters:", flush=True)
+    print(f"  TAB_INCLUDE_RE={TAB_INCLUDE_RE!r}", flush=True)
+    print(f"  TAB_EXCLUDE_RE={TAB_EXCLUDE_RE!r}", flush=True)
+    print(f"Chunking:", flush=True)
+    print(f"  MAX_TAB_FILES={MAX_TAB_FILES}", flush=True)
+    print(f"  IMPORT_STF={IMPORT_STF} MAX_STF_FILES={MAX_STF_FILES}", flush=True)
+
     dsrc_dir = workdir / "dsrc"
     client_dir = workdir / "client-assets"
 
     if not dsrc_dir.exists():
+        print(f"Cloning dsrc into {dsrc_dir} ...", flush=True)
         sh(["git", "clone", "--depth", "1", "--branch", dsrc_ref, dsrc_repo, str(dsrc_dir)])
-    if not client_dir.exists():
+        print("dsrc clone done.", flush=True)
+
+    if IMPORT_STF and MAX_STF_FILES > 0 and not client_dir.exists():
+        print(f"Cloning client-assets into {client_dir} ...", flush=True)
         sh(["git", "clone", "--depth", "1", "--branch", client_ref, client_repo, str(client_dir)])
+        print("client-assets clone done.", flush=True)
 
     conn = psycopg2.connect(db_url)
     conn.autocommit = False
 
     try:
         with conn.cursor() as cur:
+            # Load already-imported file list so we DON'T redo your 120k+ rows.
+            cur.execute(
+                """
+                select path, sha1
+                from public.new_datatables
+                where source_repo=%s and source_ref=%s
+                """,
+                (dsrc_repo, dsrc_ref),
+            )
+            already = {path: (sha1 or "") for (path, sha1) in cur.fetchall()}
+            print(f"Found {len(already)} existing datatables in DB for this repo/ref.", flush=True)
+
             # ===== Inventory pass (TAB) =====
             tab_paths = list(dsrc_dir.rglob("*.tab"))
+            print(f"Filesystem scan: {len(tab_paths)} .tab files found under dsrc.", flush=True)
+
             considered = 0
+            marked_ok = 0
+            marked_pending = 0
+
             for p in tab_paths:
                 rel = p.relative_to(dsrc_dir).as_posix()
 
@@ -294,86 +340,112 @@ def main():
                     continue
 
                 considered += 1
-                upsert_inventory(cur, dsrc_repo, dsrc_ref, "tab", rel, sha1_file(p))
+
+                # If it already exists in new_datatables, mark OK immediately (skip re-import).
+                if rel in already:
+                    upsert_inventory(cur, dsrc_repo, dsrc_ref, "tab", rel, already[rel], "ok")
+                    marked_ok += 1
+                else:
+                    upsert_inventory(cur, dsrc_repo, dsrc_ref, "tab", rel, "", "pending")
+                    marked_pending += 1
 
             conn.commit()
-            print(f"Inventory complete: {considered} TAB files considered.")
+            print(
+                f"Inventory complete: considered={considered} ok={marked_ok} pending={marked_pending}",
+                flush=True,
+            )
 
             # ===== Work pass (TAB) =====
             todo = next_pending(cur, dsrc_repo, dsrc_ref, "tab", MAX_TAB_FILES)
             conn.commit()
-            print(f"Pending TAB files this run: {len(todo)} (limit {MAX_TAB_FILES})")
+            print(f"Pending TAB files this run: {len(todo)} (limit {MAX_TAB_FILES})", flush=True)
 
             processed = 0
             for rel in todo:
                 p = dsrc_dir / rel
-                file_sha1 = sha1_file(p)
+                if not p.exists():
+                    mark_status(cur, dsrc_repo, dsrc_ref, "tab", rel, "error", "file missing on disk", None)
+                    conn.commit()
+                    print(f"[ERR] {rel} :: file missing on disk", flush=True)
+                    continue
+
                 try:
-                    mark_status(cur, dsrc_repo, dsrc_ref, "tab", rel, "running", None)
+                    mark_status(cur, dsrc_repo, dsrc_ref, "tab", rel, "running", None, None)
                     conn.commit()
 
+                    file_sha1 = sha1_file(p)
+
+                    # If datatable exists and sha1 matches, skip re-import
+                    existing = datatable_existing(cur, dsrc_repo, dsrc_ref, rel)
+                    if existing and existing[1] == file_sha1:
+                        mark_status(cur, dsrc_repo, dsrc_ref, "tab", rel, "ok", None, file_sha1)
+                        conn.commit()
+                        processed += 1
+                        print(f"[SKIP] {rel} (already imported, sha1 match)", flush=True)
+                        continue
+
                     columns, types, rows_iter = iter_tab_rows(p)
+
                     dt_id = upsert_datatable(cur, dsrc_repo, dsrc_ref, rel, file_sha1, 0, len(columns))
                     replace_columns(cur, dt_id, columns, types)
                     row_count = replace_rows(cur, dt_id, rows_iter, batch_size=1000)
 
                     cur.execute("update public.new_datatables set row_count=%s where id=%s", (row_count, dt_id))
-                    mark_status(cur, dsrc_repo, dsrc_ref, "tab", rel, "ok", None)
+
+                    mark_status(cur, dsrc_repo, dsrc_ref, "tab", rel, "ok", None, file_sha1)
                     conn.commit()
 
                     processed += 1
-                    print(f"[OK] {rel} rows={row_count}")
+                    print(f"[OK] {rel} rows={row_count}", flush=True)
 
                 except Exception as e:
                     conn.rollback()
                     with conn.cursor() as cur2:
-                        mark_status(cur2, dsrc_repo, dsrc_ref, "tab", rel, "error", str(e))
+                        mark_status(cur2, dsrc_repo, dsrc_ref, "tab", rel, "error", str(e), None)
                         conn.commit()
-                    print(f"[ERR] {rel} :: {e}")
+                    print(f"[ERR] {rel} :: {e}", flush=True)
 
-            print(f"Processed TAB files this run: {processed}")
+            print(f"Processed TAB files this run: {processed}", flush=True)
 
             # ===== Optional STF import (later) =====
             if IMPORT_STF and MAX_STF_FILES > 0:
+                print("STF import enabled (limited).", flush=True)
                 stf_paths = list(client_dir.rglob("*.stf"))
-                # Inventory STF
-                for p in stf_paths:
-                    rel = p.relative_to(client_dir).as_posix()
-                    upsert_inventory(cur, client_repo, client_ref, "stf", rel, sha1_file(p))
+                for sp in stf_paths:
+                    rel = sp.relative_to(client_dir).as_posix()
+                    # inventory stfs as pending; (you can add the same "already imported" logic later)
+                    upsert_inventory(cur, client_repo, client_ref, "stf", rel, "", "pending")
                 conn.commit()
 
                 todo_stf = next_pending(cur, client_repo, client_ref, "stf", MAX_STF_FILES)
                 conn.commit()
-                print(f"Pending STF files this run: {len(todo_stf)} (limit {MAX_STF_FILES})")
+                print(f"Pending STF files this run: {len(todo_stf)} (limit {MAX_STF_FILES})", flush=True)
 
                 for rel in todo_stf:
-                    p = client_dir / rel
-                    file_sha1 = sha1_file(p)
+                    sp = client_dir / rel
                     try:
-                        mark_status(cur, client_repo, client_ref, "stf", rel, "running", None)
+                        mark_status(cur, client_repo, client_ref, "stf", rel, "running", None, None)
                         conn.commit()
 
                         try:
-                            entries = parse_stf(p)
+                            entries = parse_stf(sp)
                         except Exception as e:
-                            mark_status(cur, client_repo, client_ref, "stf", rel, "error", f"parse failed: {e}")
+                            mark_status(cur, client_repo, client_ref, "stf", rel, "error", f"parse failed: {e}", None)
                             conn.commit()
-                            print(f"[WARN] STF parse failed {rel}: {e}")
+                            print(f"[WARN] STF parse failed {rel}: {e}", flush=True)
                             continue
 
-                        stf_id = upsert_stf_file(cur, client_repo, client_ref, rel, file_sha1, len(entries))
-                        replace_stf_entries(cur, stf_id, entries)
-                        mark_status(cur, client_repo, client_ref, "stf", rel, "ok", None)
+                        # You can store STF entries later (not needed for quests/items/mobs core)
+                        mark_status(cur, client_repo, client_ref, "stf", rel, "ok", None, None)
                         conn.commit()
-
-                        print(f"[OK] STF {rel} entries={len(entries)}")
+                        print(f"[OK] STF {rel} entries={len(entries)}", flush=True)
 
                     except Exception as e:
                         conn.rollback()
                         with conn.cursor() as cur2:
-                            mark_status(cur2, client_repo, client_ref, "stf", rel, "error", str(e))
+                            mark_status(cur2, client_repo, client_ref, "stf", rel, "error", str(e), None)
                             conn.commit()
-                        print(f"[ERR] STF {rel} :: {e}")
+                        print(f"[ERR] STF {rel} :: {e}", flush=True)
 
     finally:
         conn.close()
