@@ -29,7 +29,7 @@ jobs:
           DSRC_REF: master
           CLIENT_REPO: https://github.com/SWG-Source/client-assets.git
           CLIENT_REF: master
-          MAX_TAB_FILES: "40"     # import 40 tab files per run (tune later)
+          MAX_TAB_FILES: "0"     # import 40 tab files per run (tune later)
           MAX_STF_FILES: "0"      # keep off for now
           PYTHONUNBUFFERED: "1"
 
@@ -37,7 +37,7 @@ jobs:
 
           # Only bring what you asked for:
           TAB_INCLUDE_RE: '(quest|creature|npc|loot|junk|chu[_-]?gon[_-]?dar|schem|draft[_-]?schem|item|weapon|armor|waypoint|poi|spawn)'
-          TAB_EXCLUDE_RE: '(terrain|region|area|planetmap|map|ui|appearance|shader|client)'
+          TAB_EXCLUDE_RE: '(appearance|shader|ui|terrain)'
 
           # strings off for now (we can add later)
           IMPORT_STF: '0'
