@@ -29,7 +29,7 @@ jobs:
           DSRC_REF: master
           CLIENT_REPO: https://github.com/SWG-Source/client-assets.git
           CLIENT_REF: master
-          MAX_TAB_FILES: "0"     # import 40 tab files per run (tune later)
+          MAX_TAB_FILES: "40"
           MAX_STF_FILES: "0"      # keep off for now
           PYTHONUNBUFFERED: "1"
 
