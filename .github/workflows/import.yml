@@ -2,6 +2,12 @@ name: Import SWG data into Supabase (new_ tables)
 
 on:
   workflow_dispatch: {}
+  schedule:
+    - cron: "0 * * * *" # every hour (UTC)
+
+concurrency:
+  group: swg-import
+  cancel-in-progress: false
 
 jobs:
   import:
@@ -25,21 +31,25 @@ jobs:
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           WORKDIR: _work
+
           DSRC_REPO: https://github.com/SWG-Source/dsrc.git
           DSRC_REF: master
+
           CLIENT_REPO: https://github.com/SWG-Source/client-assets.git
           CLIENT_REF: master
-          MAX_TAB_FILES: "40"
-          MAX_STF_FILES: "0"      # keep off for now
+
+          # How many TAB files to import per run
+          MAX_TAB_FILES: "400"
+
+          # Keep STF off for now
+          MAX_STF_FILES: "0"
+          IMPORT_STF: "0"
+
           PYTHONUNBUFFERED: "1"
-
-
 
           # Only bring what you asked for:
           TAB_INCLUDE_RE: '(quest|creature|npc|loot|junk|chu[_-]?gon[_-]?dar|schem|draft[_-]?schem|item|weapon|armor|waypoint|poi|spawn)'
           TAB_EXCLUDE_RE: '(appearance|shader|ui|terrain)'
 
-          # strings off for now (we can add later)
-          IMPORT_STF: '0'
         run: |
           python -u scripts/import_swg.py
